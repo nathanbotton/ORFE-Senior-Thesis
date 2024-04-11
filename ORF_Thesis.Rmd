@@ -1,0 +1,967 @@
+---
+title: "ORFE_Thesis"
+author: "Nathan Botton"
+date: '2024-04-11'
+output:
+  html_document: default
+  pdf_document: default
+---
+```{r setup, include=FALSE, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "/Users/nathanbotton/ORF_Thesis")
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(tseries)
+library(uroot)
+library(locits)
+library(urca)
+library(FCVAR)
+library(data.table)
+library(e1071)
+library(tsDyn)
+library(GGally)
+library(vars)
+library(zoo)
+library(TTR)
+library(scales)
+library(RColorBrewer)
+library(gt)
+```
+
+The following is the code that performs the modeling and analysis for *Dynamic Price Relationships Among EV Battery Metals: A Cointegration and VECM Approach with Trading Strategy Applications*, my senior thesis for the Operations Research and Financial Engineering Department at Princeton University.
+
+The overall goal of the study is to create a strategy that at each predetermined point in time trains a Vector Error Correction Model (VECM) on EV battery metals price data in a specified preceding time window, and makes a prediction for the next change in price of each metal in order to develop strong risk-adjusted trading performance.
+
+
+# Data Preprocessing
+
+### Load in the metals price data
+PRICES, the only input to this code, is a .csv file in which the first column contains dates, and the subsequent columns contain the prices of each metal on that date.
+Price data for the metals was sourced from Datastream, accessed through WRDS.
+```{r, message=FALSE, warning=FALSE}
+PRICES = read.csv("evmetalsprices4.csv")
+names(PRICES) = c("Date", "Mo", "Li", "Cu", "Mn", "Co","Ni")
+PRICES$Date = as.Date(PRICES$Date, format="%m/%d/%y")
+PRICES = PRICES[c("Date", "Li", "Co", "Ni", "Mn","Cu")]
+rownames(PRICES) = NULL
+METALS = c("Li", "Co", "Ni", "Mn","Cu")
+
+
+END_TRAINING = as.Date("2019-12-31") 
+END_DATA = as.Date("2024-1-4") 
+
+head(PRICES)
+```
+
+### Functions to preprocess data, prepare for Johansen test, and perform Johansen test
+```{r message=FALSE, warning=FALSE}
+# Data preprocessing, log-price summary statistics, and log-price plot
+handle_data = function(pricedata) {
+    # take log of prices
+    logprices = pricedata %>%
+        mutate(across(-Date, log))
+    
+    # summary statistics
+    logprices_long = pivot_longer(logprices, cols = -Date, names_to = "Metal", 
+                                  values_to = "Price")
+    summary_stats_log = logprices_long %>%
+        group_by(Metal) %>%
+        summarise(
+            Mean = mean(Price, na.rm = TRUE),
+            Max = max(Price, na.rm = TRUE),
+            Min = min(Price, na.rm = TRUE),
+            StdDev = sd(Price, na.rm = TRUE),
+            Skew = skewness(Price, type = 3, na.rm = TRUE),
+            .groups = "drop") 
+    
+    # plot log-prices
+    logplot = ggplot(data = logprices_long, aes(x = Date, y = Price, color = Metal)) +
+                  geom_line() +
+                  theme_light(base_family = "Times") + 
+                  theme(
+                    axis.title.x = element_text(size = 12, margin = margin(t = 15)), 
+                    axis.title.y = element_text(size = 12 , margin = margin(r = 15)),
+                    plot.title = element_text(size = 18),
+                    legend.title = element_text(size = 12),
+                    legend.text = element_text(size = 10),
+                    plot.margin = unit(c(0.5, 0.5, 0.5, 0.5), "cm")
+                  ) +
+                  labs(
+                    title = "Log-Prices Over Time",
+                    x = "Date",
+                    y = "Log-Price",
+                    color = "Metal"
+                  ) +
+                  scale_x_date(
+                    date_breaks = "1 year",
+                    date_labels = "%Y",
+                    expand = c(0.01, 0) 
+                  ) +
+                  guides(colour = guide_legend(override.aes = list(size=4)))
+
+  return(list(logprices=logprices, logstats=summary_stats_log, logplot=logplot))
+}
+
+
+# Use ADF test to check for non-stationarity and determine optimal lag length
+testprep = function(logprices) {
+    logmatrix = data.matrix(logprices)[,-1] # remove date column
+    adf_result = apply(logmatrix, 2, adf.test)
+    # array of different lag length criteria
+    var_result = VARselect(logmatrix, lag.max=15, type="both")  
+    aic = var_result$selection[1] # AIC
+    
+    return(list(adf=adf_result, aic=aic))
+}
+
+
+# Perform Johansen test
+johansen = function(logprices, lag, long=FALSE) {
+    logmatrix = data.matrix(logprices)[,-1] # remove date column
+    
+    
+    # set edcet and spec to (trend,longrun) for full dataset and (const,transitory) 
+    # for windows, as long time frame will more likely exhibit trend, short time 
+    # frame will not
+    if(long) {
+        edcet = 'trend'
+        spec = 'longrun'
+    }
+    else{
+        edcet = 'const'
+        spec = 'transitory'
+    }
+    
+    # perform the Johansen test
+    cajo_result = ca.jo(logmatrix, 
+        type = 'eigen', 
+        ecdet = edcet, 
+        K = lag,
+        spec=spec, 
+        season = NULL, 
+        dumvar = NULL)
+    
+    # extract directly the number of cointegrating relationships using the 10% 
+    # critical value
+    table = cajo_result@cval
+    teststat = cajo_result@teststat
+    nrel = 0
+    if (teststat[5] > table[5,1]) {
+        nrel = 1
+        if (teststat[4] > table[4,1]) {
+            nrel=2
+            if (teststat[3] > table[3,1]) {
+                nrel=3
+                if (teststat[2] > table[2,1]) {
+                    nrel=4
+                }
+            }
+        }
+    }
+    
+    # create linear combination of cointegrating relationship and test its stationarity
+    cajo_evec = cajo_result@V[,1][1:ncol(logmatrix)]
+    const = cajo_result@V[,1][ncol(logmatrix)+1]
+    lin_comb = logmatrix %*% cajo_evec
+    adf = adf.test(lin_comb)
+
+    # visualize the cointegrating linear relationship
+    plot_data = data.frame(Date = logprices$Date, LinComb = lin_comb, 
+                           ConstLine = -const)
+    plot = ggplot(plot_data, aes(x = Date)) +
+        geom_line(aes(y = LinComb), color = "black") +
+        geom_hline(aes(yintercept = ConstLine), color = "red") +
+        labs(x = "Date", y = "Value") +
+        theme_minimal()
+        
+    return(list(cajo = cajo_result, adf = adf, plot = plot, nrel = nrel))
+}
+```
+
+
+### Preprocess price data, show summary stats and plot log-prices
+```{r message=FALSE, warning=FALSE}
+pricedata = handle_data(PRICES)
+LOGPRICES = pricedata$logprices
+head(LOGPRICES)
+pricedata$logstats
+fig1_logprices = pricedata$logplot
+#ggsave("fig1_logprices.pdf", plot = fig1_logprices, device = "pdf", width = 8, height = 4)
+fig1_logprices
+```
+
+# Testing for Cointegration
+
+### Test sample data for stationarity, determine optimal lag length, and test for cointegration
+```{r message=FALSE, warning=FALSE}
+PRICES_sample = PRICES[PRICES$Date <= END_TRAINING, ]
+LOGPRICES_sample = handle_data(PRICES_sample)$logprices
+
+print("Stationarity of log-prices:")
+adf.test(LOGPRICES_sample$Li)$p.value
+adf.test(LOGPRICES_sample$Co)$p.value
+adf.test(LOGPRICES_sample$Ni)$p.value
+adf.test(LOGPRICES_sample$Mn)$p.value
+adf.test(LOGPRICES_sample$Cu)$p.value
+
+print("Stationarity of log-price diffs:")
+adf.test(diff(LOGPRICES_sample$Li))$p.value
+adf.test(diff(LOGPRICES_sample$Co))$p.value
+adf.test(diff(LOGPRICES_sample$Ni))$p.value
+adf.test(diff(LOGPRICES_sample$Mn))$p.value
+adf.test(diff(LOGPRICES_sample$Cu))$p.value
+
+
+aic = testprep(LOGPRICES_sample)$aic
+aic
+
+sample_cajo = johansen(LOGPRICES_sample,aic,long=TRUE)
+print('Cointegration Vector')
+sample_cajo$cajo@V[,1]
+summary(sample_cajo$cajo)
+```
+
+# Model and Strategy Formulation
+
+## Determining the Optimal Lookback Window
+
+### Iterate through different length time windows at various start dates to determine optimal cointegration window
+```{r message=FALSE, warning=FALSE}
+starts = c(as.Date("2013-1-1"), as.Date("2013-6-30"), as.Date("2014-1-1"), 
+           as.Date("2014-6-30"), as.Date("2015-1-1"), as.Date("2015-6-30"), 
+           as.Date("2016-1-1"), as.Date("2016-6-30"), as.Date("2017-1-1"), 
+           as.Date("2017-6-30"), as.Date("2018-1-1"), as.Date("2018-6-30"), 
+           as.Date("2019-1-1"), as.Date("2019-6-30"))
+months = c(18,24,30,36,42,48,54,60,66,72)
+
+# store results
+stats = matrix(vector("list", length(starts) * length(months)), 
+               nrow = length(starts), ncol = length(months))
+
+# test different window lengths over different time frames
+for(i in 1:length(starts)){
+    for(j in 1:length(months)){
+        e = as.Date(starts[i]) + months(months[j])
+        # skip if range would exceed past end of training data
+        if(e > END_TRAINING) {next}      
+         # extract relevant price data window
+        prices_cut = PRICES[PRICES$Date >= starts[i] & PRICES$Date <= e, ] 
+        
+        # prepare data and perform Johansen test
+        handled_data = handle_data(prices_cut)
+        logprices = handled_data$logprices
+        prep = testprep(logprices)
+        aic = prep$aic
+        if(aic<2){aic=2}  # Johansen test takes minimum lag length of 2
+        johansen_test = johansen(logprices,aic)
+        
+        # extract relevant metrics
+        # check for non-stationarity in all log-price series
+        nonstationary = all(sapply(prep$adf, function(x) x$p.value) > .05) 
+        max_eval = (johansen_test$cajo)@lambda[1]   # check max eval
+        # check for stationarity in cointegrating linear combination
+        stationary = (johansen_test$adf)$p.value    
+        nrel = johansen_test$nrel
+        if (nrel==0) {max_eval=0}
+        
+        stats[[i, j]] = list(starts[i], months[j], nonstationary, max_eval, 
+                             stationary, nrel)
+    }
+}
+
+# create dataframe of results for easy viewing
+stats_df = data.frame(Start = character(),
+                         Month = numeric(),
+                         Nonstationary = logical(),
+                         Max_Eval = numeric(),
+                         Stationary = numeric(),
+                         NumRel= numeric())
+
+for(i in 1:length(starts)){
+    for(j in 1:length(months)){
+        start_date = stats[[i, j]][[1]]
+        month_duration = stats[[i, j]][[2]]
+        nonstationary = stats[[i, j]][[3]]
+        max_eval = stats[[i, j]][[4]]
+        stationary = stats[[i, j]][[5]]
+        numrel = stats[[i, j]][[6]]
+
+        stats_df = rbind(stats_df, data.frame(Start = start_date,
+                                                    Month = month_duration,
+                                                    Nonstationary = nonstationary,
+                                                    Max_Eval = max_eval,
+                                                    Stationary = stationary,
+                                                    NumRel = numrel))
+    }
+}
+
+# order by window length, calculate instances of cointegration (%) and see results
+stats_df$coint = (stats_df$NumRel != 0)
+stats_df = stats_df[order(stats_df$Month), ]
+#print(stats_df)
+stats_df_summary = stats_df %>% group_by(Month) %>% 
+    summarise(MaxEval = mean(Max_Eval), Coint = mean(coint))
+print(stats_df_summary)
+```
+
+
+## Train the VECMs according to trade strategy and make predictions
+
+### Make predictions over a certain timeframe with a certain prediction frequency and lookback window
+```{r message=FALSE, warning=FALSE}
+# Every nahead-th day from startdate until enddate, train a VECM using price data 
+# from WINDOW months back from startdate, and make a prediction for nahead days out. 
+makepredictions = function(startdate, WINDOW, nahead, enddate) {
+   # extract list of trading dates to make predictions on
+    datelist = (PRICES$Date)[PRICES$Date >= startdate & PRICES$Date <= enddate]
+    
+    predictions = data.frame()
+    
+    # calulate % time VECMs are used
+    count=0
+    var=0
+    
+    # track cointegration vectors- artificially add first row in case predictions 
+    # start with VAR in which case the most recent cointegration vector from a 
+    # VECM is pulled forward
+    rels = data.frame(Date = as.Date("2000-01-01"), 
+                      Li = 1, Co = 0, Ni = 0, Mn = 0, Cu = 0)
+    
+    # at every nahead date, 
+    for (i in seq(1, length(datelist), by = nahead)) {
+        d = datelist[i]
+        pred_date = as.Date(d)
+        count = count+1
+        
+        # train on past WINDOW months
+        window_start = pred_date - days(WINDOW*30)
+        prices_cut = PRICES[PRICES$Date >= window_start & PRICES$Date <= pred_date, ]
+       
+        handled_data = handle_data(prices_cut)
+        logprices = handled_data$logprices
+        logmatrix = data.matrix(logprices)[,-1] 
+        # calculate volatility for each metal in its window
+        vols = apply(logmatrix, 2, function(x) sd(x, na.rm = TRUE)) 
+        
+        aic=testprep(logprices)$aic
+        if(aic<2){aic=2}
+        nrel = johansen(logprices,aic)$nrel
+        if(nrel==0){
+            var=var+1
+            # use VAR model if no cointegrating relationships are found
+            var_model = VAR(logmatrix, p = aic-1, type = "const")
+            pred = predict(var_model, n.ahead = nahead)$fcst
+            pred = sapply(pred, function(fcst) fcst[1, "fcst"])
+            # if using VAR just fill rels with last cointegrating vector
+            rels = rbind(rels, c(list(Date = d), 
+                                 setNames(as.list(rels[nrow(rels), -1]), METALS)))
+
+        }
+        else{
+            # train VECM (takes in lag used for Johansen-1)
+            vecm = VECM(logmatrix, lag=aic-1, r=nrel, include="const")
+            pred = predict(vecm, n.ahead=nahead)
+            pred = pred[nrow(pred),]
+            # extract cointegration vector
+            coeffs = setNames(as.numeric(coefB(vecm)[, 1]), METALS)  
+            new_row = c(list(Date = d), as.list(coeffs)) 
+            rels = rbind(rels, new_row)
+
+        }
+        
+        # add at each date, the prediction for nahead points ahead, 
+        # and the volatility at the time
+        new_row = data.frame(Date = d, Li = pred[1], Co = pred[2],
+                            Ni = pred[3], Mn = pred[4], Cu = pred[5],
+                            vLi = vols[1], vCo = vols[2], vNi = vols[3], 
+                            vMn = vols[4], vCu = vols[5])
+        
+        predictions = rbind(predictions, new_row)
+    }
+    
+    # at each day, show actual price on that day and prediction for nahead points in time
+    aligned_prices = merge(predictions, LOGPRICES, by = "Date", suffixes = c("_p", "_a"))
+    
+    # calculate expected and actual change, and signal nec
+    for (metal in METALS) {
+        aligned_prices[[paste0("ec", metal)]] = aligned_prices[[paste0(metal, "_p")]] - 
+            aligned_prices[[paste0(metal, "_a")]]
+        aligned_prices[[paste0("ac", metal)]] = 
+            diff(c(aligned_prices[[paste0(metal, "_a")]], rep(NA, nahead)), lag = nahead)
+        aligned_prices[[paste0("nec", metal)]] = aligned_prices[[paste0("ec", metal)]] / 
+            aligned_prices[[paste0("v", metal)]]
+    }
+    print(paste0('% times VECM used: ', 1-var/count))
+    
+   
+    rels = rels[-1, ]  # take out aritifically added first row
+    rels = rels[rels$Ni != 0, ] # remove first instances of VAR if that is the case
+    
+    return(list(aligned_prices = aligned_prices, rels=rels))
+}
+```
+
+
+## Create RMSE and Directional Accuracy Evaluation
+```{r warning=FALSE}
+# evaluate rmses, directional accuracy for nonzero changes, mean prediction for 
+# zero changes, and probability of better than random
+evalmetrics = function(predictions){ 
+    rmses = vector("numeric", length(METALS))
+    names(rmses) = METALS
+    actual_sd = vector("numeric", length(METALS))
+    names(actual_sd) = METALS
+    danz =  vector("numeric", length(METALS))
+    names(danz) = METALS
+    zero_preds = numeric()
+    
+    num_nz_guesses = 0
+    num_correct_nz_guesses = 0
+    for (metal in METALS) {
+        # RMSE
+        errors = predictions[[paste0("ac",metal)]] - 
+            predictions[[paste0("ec",metal)]]
+        rmses[metal] = sqrt(mean(errors^2, na.rm = TRUE))
+        # actual sd
+        actual_sd[metal] = sd(predictions[[paste0("ac",metal)]], na.rm=TRUE)
+        
+        # mean guess when actual change is zero
+        zero_changes = predictions[predictions[[paste0("ac",metal)]] == 0, 
+                                   paste0("ec",metal)]
+        zero_preds = c(zero_preds,zero_changes)
+        
+        # directional accuracy for nonzero changes
+        nonzero_changes = predictions[predictions[[paste0("ac",metal)]] != 0, ]
+        correct_pred = (sign(nonzero_changes[[paste0("ac",metal)]]) == 
+                            sign(nonzero_changes[[paste0("ec",metal)]]))
+        danz[metal] = mean(correct_pred, na.rm=TRUE)
+        
+        num_nz_guesses = num_nz_guesses + 
+            sum(!is.na(nonzero_changes[[paste0("ac",metal)]]))
+        num_correct_nz_guesses = num_correct_nz_guesses + 
+            sum(correct_pred, na.rm=TRUE)
+        
+        
+    }
+    
+    mzero = mean(zero_preds, na.rm=TRUE)
+    prob_random = 1 - pbinom(num_correct_nz_guesses-1, num_nz_guesses, 0.5)
+
+    
+    return(list(rmses=rmses, danz=danz, sd=actual_sd, mz=mzero, prob_random = prob_random))
+}
+```
+
+
+
+## Determine Optimal Trading Frequency
+```{r message=FALSE, warning=FALSE, echo=TRUE}
+gaps = c(1,5,10,15,20,30)
+
+gap_stats = data.frame(
+  da_nz = numeric(length(gaps)), 
+  pr = numeric(length(gaps)),    
+  rmse = numeric(length(gaps))       
+)
+rownames(gap_stats) = gaps
+
+for (i in 1:length(gaps)){
+    if (TRUE) {next}    # skip entire loop because of time it takes, 
+                        #comment out if need to run
+    pred = makepredictions(as.Date("2015-1-1"), 24, 
+                           gaps[i], END_TRAINING)$aligned_prices
+    met = evalmetrics(pred)
+    gap_stats[i, "da_nz"] = mean(met$danz)
+    gap_stats[i, "rmse"] = mean(met$rmse)
+}
+#gap_stats      # comment or uncomment opposite the if statement 
+```
+
+
+
+# Evaluate Model on Sample Data
+
+### Make Predictions on Sample Data
+```{r message=FALSE, warning=FALSE}
+BEGIN= as.Date("2015-1-1")
+END= END_TRAINING
+makepreds = makepredictions(BEGIN, 24, 5, END)
+predictions = makepreds$aligned_prices
+head(predictions)
+```
+
+
+### Evaluate Sample Data: RMSEs, directional accuracy, probability of randomness
+```{r message=FALSE, warning=FALSE}
+metrics = evalmetrics(predictions)
+print("RMSEs:")
+print(metrics$rmses)
+print("Actual sds:")
+print(metrics$sd)
+print("Mean prediction for when changes are zero:")
+print(metrics$mz)
+print("Directional accuracy for nonzero changes:")
+print(metrics$danz)
+print("Probability of obtaining this directional accuracy from a random model:")
+print(metrics$prob_random)
+```
+
+
+### Create Trading Simulation
+```{r message=FALSE, warning=FALSE}
+# simulate strategy and return portfolio value, cash, holdings, Sharpe Ratio, etc.
+evaluate = function(aligned_prices, base_size, base_change){
+    
+    # perform logarithm scale on signal to determine trade size
+    for (metal in METALS) {
+        aligned_prices[[paste0("t", metal)]] = base_size * 
+            log(1 + abs(aligned_prices[[paste0("nec", metal)]]) / base_change) * 
+            sign(aligned_prices[[paste0("nec", metal)]])
+    }
+    trade_dollars = aligned_prices[paste0("t", METALS)]
+    colnames(trade_dollars) = METALS
+    
+    prices_cut = PRICES[PRICES$Date %in% aligned_prices$Date, ]
+    P = data.matrix(prices_cut)[,-1]
+    colnames(P) = METALS
+    S = trade_dollars / P   # magnitude of buy (+) or sell (-) of each metal at time t
+    S[is.na(S)] = 0
+
+    H = matrix(0, nrow = nrow(P), ncol = ncol(P))   # current holdings at time t
+    colnames(H) = METALS
+    cash = numeric(nrow(P))                     # cash at time t
+    port_value = numeric(nrow(P))           # portfolio value = profit at time t
+        
+    for (i in 1:nrow(P)){
+        if (i==1){
+            H[i,] = as.numeric(S[i,])   # initial holdings determined by first action
+            cash[i] = -as.numeric(S[i,]) %*% P[i,] # initial cash from first transaction
+        }
+        
+        else{
+            H[i,] = H[i-1,] + as.numeric(S[i,])                 # update holdings
+            cash[i] = cash[i-1] - as.numeric(S[i,]) %*% P[i,]   # update cash
+        }
+    
+        port_value[i] = H[i,]%*%P[i,] + cash[i]                 # update portfolio value
+        
+    }
+    
+    # calculate Sharpe Ratio
+    daily_returns = numeric(length(port_value) - 1)
+    # start at 3 to avoid dividing by 0, the initial portfolio value
+    for(i in 3:length(port_value)) {    
+        daily_returns[i-1] =  (port_value[i] - port_value[i-1]) / port_value[i-1]
+    }
+    Rp = mean(daily_returns, na.rm=TRUE)
+    sp = sd(daily_returns, na.rm=TRUE)
+    Rf_annual = 0.05  # 5% annual risk-free rate
+    Rf_5day = (1 + Rf_annual)^(5 / 252) - 1  # Convert to a 5-day rate
+    sharpe = (Rp-Rf_5day)/sp
+    annualized_sharpe = sharpe*sqrt(252/5)
+
+    return(list(H=H, cash=cash, port_value=port_value, P=P, sharpe=sharpe, 
+                annualized_sharpe=annualized_sharpe, Rp=Rp, sp=sp,
+                trades=trade_dollars, dates=aligned_prices$Date))
+}
+```
+
+
+### Determine Optimal Base in Trade Function
+```{r message=FALSE, warning=FALSE}
+# start at .5 as lower values defeat the purpose of controlling 
+# trade size based on function shape
+bases = seq(.5, 2, by = 0.1)
+sharpes = data.frame(b = numeric(0), Sharpe = numeric(0))
+for (b in bases) {
+    eval = evaluate(predictions, 100, b)
+    s = eval$annualized_sharpe
+    sharpes = rbind(sharpes, data.frame(b = b, Sharpe = s))
+}
+sharpes
+```
+
+
+### Simulate and Evaluate Trading Strategy on Sample Data
+```{r message=FALSE, warning=FALSE}
+base_size = 100
+base_change = 1
+results = evaluate(predictions, base_size, base_change)
+
+H = results$H
+P = results$P
+holding_values = H*P
+colnames(holding_values) = METALS
+dates = results$dates
+cash = results$cash
+port_value = results$port_value
+trades = results$trades
+print(paste0("Annualized sharpe = ", results$annualized_sharpe))
+print(paste0("Average return = ", results$Rp))
+print(paste0("Returns sd = ", results$sp))
+
+# plot portfolio value
+fig3_spv = ggplot(data = data.frame(Date = dates, Y = port_value), 
+                  aes(x = Date, y = Y)) +
+      geom_line(color = "darkgreen") +  
+      theme_light(base_family = "Times") +  
+      theme(
+        axis.title.x = element_text(size = 14, margin = margin(t = 15)),
+        axis.title.y = element_text(size = 14, margin = margin(r = 1)),
+        plot.title = element_text(size = 18),
+        plot.margin = unit(c(0.5, 1.5, .5, .5), "cm")
+      ) +
+      labs(
+        title = "Portfolio Value Over Time",
+        x = "Time",
+        y = "Portfolio Value (USD)"
+      ) +
+      scale_x_date(
+        date_breaks = "1 year",
+        date_labels = "%Y",
+        expand = c(0.01, 0) 
+      ) +
+      scale_y_continuous(
+        labels = comma,
+        breaks = pretty(range(port_value), n = 10), 
+        limits = c(min(port_value), max(port_value)*1.1) 
+      )
+#ggsave("fig3_spv.pdf", plot = fig3_spv, device = "pdf", width = 8, height = 4)
+fig3_spv
+
+# plot cash
+fig4_scash = ggplot(data = data.frame(Date = dates, Y = cash), aes(x = Date, y = Y)) +
+      geom_line(color = "blue") +  
+      theme_light(base_family = "Times") + 
+      theme(
+        axis.title.x = element_text(size = 14, margin = margin(t = 15)),
+        axis.title.y = element_text(size = 14, margin = margin(r = 1)),
+        plot.title = element_text(size = 18),
+        plot.margin = unit(c(0.5, 1.5, .5, .5), "cm") 
+      ) +
+      labs(
+        title = "Cash Over Time",
+        x = "Time",
+        y = "Cash (USD)"
+      ) +
+      scale_x_date(
+        date_breaks = "1 year",
+        date_labels = "%Y",
+        expand = c(0.01, 0) 
+      ) +
+      scale_y_continuous(
+        labels = comma,
+        breaks = pretty(range(cash), n = 10), 
+        limits = c(min(cash), max(cash)*1.1)
+      )
+#gsave("fig4_scash.pdf", plot = fig4_scash, device = "pdf", width = 8, height = 4)
+fig4_scash
+
+# Plot point-wise profit
+profit_diff = c(diff(port_value))
+ggplot(data = data.frame(Date = dates[-1], Y = profit_diff), aes(x = Date, y = Y)) +
+      geom_line(color = "red") + 
+      theme_light(base_family = "Times") + 
+      theme(
+        axis.title.x = element_text(size = 14, margin = margin(t = 15)),
+        axis.title.y = element_text(size = 14, margin = margin(r = 1)),
+        plot.title = element_text(size = 18),
+        plot.margin = unit(c(0.5, 1.5, .5, .5), "cm") 
+      ) +
+      labs(
+        title = "Point-Wise Profit",
+        x = "Time",
+        y = "Change in Portfolio Value (USD)"
+      ) +
+      scale_x_date(
+        date_breaks = "1 year",
+        date_labels = "%Y",
+        expand = c(0.01, 0) 
+      ) +
+      scale_y_continuous(
+        labels = comma,
+        breaks = pretty(range(profit_diff), n = 10),
+        limits = c(min(profit_diff), max(profit_diff)*1.1)  
+      )
+
+# Plot holdings
+holding_df = as.data.frame(holding_values)
+names(holding_df) = colnames(holding_values) 
+holding_df$Date = dates
+holding_long = pivot_longer(holding_df, cols = -Date, names_to = "Metal", 
+                             values_to = "Value")
+fig5_sholding = ggplot(holding_long, aes(x = Date, y = Value, color = Metal)) +
+  geom_line() +
+  theme_light(base_family = "Times") +
+  theme(
+    axis.title.x = element_text(size = 12, margin = margin(t = 15)),
+    axis.title.y = element_text(size = 12, margin = margin(r = 15)),
+    plot.title = element_text(size = 18),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10),
+    plot.margin = unit(c(0.5, 0.5, 0.5, 0.5), "cm")
+  ) +
+  labs(
+    title = "Holding Values Over Time",
+    x = "Time",
+    y = "Holding Values (USD)",
+    color = "Metal"
+  ) +
+  scale_x_date(
+    date_breaks = "1 year",
+    date_labels = "%Y",
+    expand = c(0.01, 0)
+  ) 
+#ggsave("fig5_sholding.pdf", plot = fig5_sholding, device = "pdf", width = 8, height = 4)
+fig5_sholding
+```
+
+
+# Feature Regression on Profitability
+```{r message=FALSE, warning=FALSE}
+# indicator vector of if portfolio value is higher than current value a month out
+indicator_vector = rep(NA, length(port_value))
+indicator_vector[1:(length(port_value) - 20)] = 
+    as.integer(port_value[1:(length(port_value) - 20)] < 
+                   port_value[21:length(port_value)])
+plot(dates, indicator_vector)
+
+logpricematrix = diff(log(data.matrix(PRICES)[,-1]))    # these are returns
+# compute and plot rolling autocorrelation
+rolling_autocorr = rollapply(logpricematrix, width=20, 
+    FUN=function(x) acf(x, lag.max=1, plot=FALSE)$acf[2], by.column=TRUE, 
+    align="right", fill=NA)
+mean_autocorr = rowMeans(rolling_autocorr, na.rm = TRUE)
+plot(PRICES$Date[-1], mean_autocorr, type = 'l', xlab = "Time",
+    ylab = "Mean Return Autocorrelation", main = "Mean Return Autocorrelation Over Time")
+
+# compute and plot rolling variance
+rolling_variance = rollapply(logpricematrix, width=20, FUN=var, by.column=TRUE, 
+                             align="right", fill=NA)
+mean_variance = rowMeans(rolling_variance, na.rm = TRUE)
+plot(PRICES$Date[-1], mean_variance, type = 'l', xlab = "Time", 
+     ylab = "Mean Return Variance", main = "Mean Return Variance Over Time")
+
+autocorrs = mean_autocorr[PRICES$Date %in% dates]
+variances = mean_variance[PRICES$Date %in% dates]
+data_for_logit = data.frame(
+  Indicator = indicator_vector[1:(length(indicator_vector) - 20)], # remove last 20 NAs
+  Autocorr = autocorrs[1:(length(autocorrs) - 20)],  # and align these
+  Variance = variances[1:(length(variances) - 20)] 
+)
+data_for_logit = na.omit(data_for_logit)
+
+# train and show logistic regression
+logit = glm(Indicator ~ Variance + Autocorr, family = binomial(link = "logit"), 
+            data = data_for_logit)
+summary(logit)
+```
+
+
+
+
+# Evaluate Model on Out-of-Sample Data
+
+### Make Predictions on Out-of-Sample Data
+```{r message=FALSE, warning=FALSE}
+BEGIN_oos= END_TRAINING + days(1)
+END_oos= END_DATA
+makepreds_oos = makepredictions(BEGIN_oos, 24, 5, END_oos)
+predictions_oos = makepreds_oos$aligned_prices
+head(predictions_oos)
+```
+
+### Evaluate Out-of-Sample Data: RMSEs, directional accuracy, probability of randomness
+```{r message=FALSE, warning=FALSE}
+metrics_oos = evalmetrics(predictions_oos)
+print("RMSEs:")
+print(metrics_oos$rmses)
+print("Actual sds:")
+print(metrics_oos$sd)
+print("Mean prediction for when changes are zero:")
+print(metrics_oos$mz)
+print("Directional accuracy for nonzero changes:")
+print(metrics_oos$danz)
+print("Probability of obtaining this directional accuracy from a random model:")
+print(metrics_oos$prob_random)
+```
+
+### Simulate and Evaluate Trading Strategy on Out-of-Sample Data
+```{r message=FALSE, warning=FALSE}
+results_oos = evaluate(predictions_oos, base_size, base_change)
+
+H_oos = results_oos$H
+P_oos = results_oos$P
+holding_values_oos = H_oos*P_oos
+colnames(holding_values_oos) = METALS
+dates_oos = results_oos$dates
+cash_oos = results_oos$cash
+port_value_oos = results_oos$port_value
+trades_oos = results_oos$trades
+print(paste0("Annualized sharpe = ", results_oos$annualized_sharpe))
+print(paste0("Average return = ", results_oos$Rp))
+print(paste0("Returns sd = ", results_oos$sp))
+
+# plot portfolio value
+fig6_oospv = ggplot(data = data.frame(Date = dates_oos, Y = port_value_oos), 
+                    aes(x = Date, y = Y)) +
+      geom_line(color = "darkgreen") + 
+      theme_light(base_family = "Times") +
+      theme(
+        axis.title.x = element_text(size = 14, margin = margin(t = 15)),
+        axis.title.y = element_text(size = 14, margin = margin(r = 1)),
+        plot.title = element_text(size = 18),
+        plot.margin = unit(c(0.5, 1.5, .5, .5), "cm")
+      ) +
+      labs(
+        title = "Portfolio Value Over Time",
+        x = "Time",
+        y = "Portfolio Value (USD)"
+      ) +
+      scale_x_date(
+        date_breaks = "1 year",
+        date_labels = "%Y",
+        expand = c(0.01, 0) 
+      ) +
+      scale_y_continuous(
+        labels = comma,
+        breaks = pretty(range(port_value_oos), n = 10),
+        limits = c(min(port_value_oos), max(port_value_oos)*1.1) 
+      )
+#ggsave("fig6_oospv.pdf", plot = fig6_oospv, device = "pdf", width = 8, height = 4)
+fig6_oospv
+
+# plot cash
+fig7_ooscash = ggplot(data = data.frame(Date = dates_oos, Y = cash_oos), 
+                      aes(x = Date, y = Y)) +
+      geom_line(color = "blue") + 
+      theme_light(base_family = "Times") + 
+      theme(
+        axis.title.x = element_text(size = 14, margin = margin(t = 15)),
+        axis.title.y = element_text(size = 14, margin = margin(r = 1)),
+        plot.title = element_text(size = 18),
+        plot.margin = unit(c(0.5, 1.5, .5, .5), "cm")
+      ) +
+      labs(
+        title = "Cash Over Time",
+        x = "Time",
+        y = "Cash (USD)"
+      ) +
+      scale_x_date(
+        date_breaks = "1 year",
+        date_labels = "%Y",
+        expand = c(0.01, 0)  
+      ) +
+      scale_y_continuous(
+        labels = comma,
+        breaks = pretty(range(cash_oos), n = 10), 
+        limits = c(min(cash_oos), max(cash_oos)*1.1) 
+      )
+#ggsave("fig7_ooscash.pdf", plot = fig7_ooscash, device = "pdf", width = 8, height = 4)
+fig7_ooscash
+
+# Plot point-wise profit
+profit_diff_oos = c(diff(port_value_oos))
+ggplot(data = data.frame(Date = dates_oos[-1], Y = profit_diff_oos), 
+       aes(x = Date, y = Y)) +
+      geom_line(color = "red") + 
+      theme_light(base_family = "Times") +
+      theme(
+        axis.title.x = element_text(size = 14, margin = margin(t = 15)),
+        axis.title.y = element_text(size = 14, margin = margin(r = 1)),
+        plot.title = element_text(size = 18),
+        plot.margin = unit(c(0.5, 1.5, .5, .5), "cm") 
+      ) +
+      labs(
+        title = "Point-Wise Profit",
+        x = "Time",
+        y = "Change in Portfolio Value (USD)"
+      ) +
+      scale_x_date(
+        date_breaks = "1 year",
+        date_labels = "%Y",
+        expand = c(0.01, 0)
+      ) +
+      scale_y_continuous(
+        labels = comma,
+        breaks = pretty(range(profit_diff_oos), n = 10), 
+        limits = c(min(profit_diff_oos), max(profit_diff_oos)*1.1)  
+      )
+
+# Plot holding values
+holding_df_oos = as.data.frame(holding_values_oos)
+names(holding_df_oos) = colnames(holding_values_oos)  
+holding_df_oos$Date = dates_oos
+holding_long_oos = pivot_longer(holding_df_oos, cols = -Date, 
+                                 names_to = "Metal", values_to = "Value")
+fig8_oosholding = ggplot(holding_long_oos, aes(x = Date, y = Value, color = Metal)) +
+  geom_line() +
+  theme_light(base_family = "Times") +
+  theme(
+    axis.title.x = element_text(size = 12, margin = margin(t = 15)),
+    axis.title.y = element_text(size = 12, margin = margin(r = 15)),
+    plot.title = element_text(size = 18),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10),
+    plot.margin = unit(c(0.5, 0.5, 0.5, 0.5), "cm")
+  ) +
+  labs(
+    title = "Holding Values Over Time",
+    x = "Time",
+    y = "Holding Values (USD)",
+    color = "Metal"
+  ) +
+  scale_x_date(
+    date_breaks = "1 year",
+    date_labels = "%Y",
+    expand = c(0.01, 0)
+  ) 
+#ggsave("fig8_oosholding.pdf", plot = fig8_oosholding, device = "pdf", width = 8, height = 4)
+fig8_oosholding
+```
+
+
+# Visualize Cointegrating Relationships
+```{r message=FALSE, warning=FALSE}
+makepreds_full = makepredictions(BEGIN, 24, 5, END_DATA)
+```
+```{r message=FALSE, warning=FALSE}
+# access cointegration vectors
+rels1_full = makepreds_full$rels
+rels1_full_smoothed = rels1_full
+
+# take rolling average to smoothen
+for(metal in c("Co", "Ni", "Mn", "Cu")) {
+  rels1_full_smoothed[[metal]] = rollmean(rels1_full[[metal]], 20, fill = NA,
+                                          align = "right")
+}
+
+rels1_long = pivot_longer(
+  data = rels1_full_smoothed,
+  cols = c(Co, Ni, Mn, Cu),
+  names_to = "Metal", 
+  values_to = "Coefficient"
+)
+fig9_cvec1 = ggplot(data = rels1_long, aes(x = Date, y = Coefficient, color = Metal)) +
+  geom_line() +
+  labs(title = "Cointegrating Coefficients Relative to Lithium=1 Over Time",
+       y = "Coefficient", x = "Date") +
+  scale_color_manual(
+    values = c("Co" = "#7CAE7A", "Ni" = "#7A9EAE", "Mn" = "#AE7A9E", "Cu" = "#AE9E7A"),
+    name = "Metal"
+  ) +
+  theme_minimal(base_family = "Times") +
+  theme(
+    plot.title = element_text(size = 18, hjust = 0.5), 
+    axis.title.x = element_text(size = 14, margin = margin(t = 10)), 
+    axis.title.y = element_text(size = 14, margin = margin(r = 10)), 
+    legend.title = element_text(size = 12), 
+    legend.text = element_text(size = 10),  
+    plot.margin = unit(c(.5, .5, .5, .5), "cm") 
+  ) +
+  ylim(-4, 4)
+#ggsave("fig9_cvec1.pdf", plot = fig9_cvec1, device = "pdf", width = 8, height = 4)
+fig9_cvec1
+```
